@@ -253,45 +253,47 @@ macro_rules! impl_scalable_omap {
                 if self.resizing_flag.load(Ordering::Relaxed) {
                     // println!("Resizing in progress, inserting to the log");
                     let mut log = self.change_log.lock().unwrap();
-                    log.push(ChangeLogEntry {
-                        key: *key,
-                        value: *val,
-                        isInsert: true,
-                    });
-                    {
-                        self.omap.lock().unwrap().insert(key, val, false);
-                    }
-                    // if the log is too large, block future insertions/erasures
-                    if log.len() >= (self.current_capacity / 5) as usize {
-                        self.block_modify_flag.store(true, Ordering::Relaxed);
-                    }
-                } else {
-                    // println!("Insert will grab the hashmap lock");
-                    let should_resize: bool;
-                    {
-                        let mut hashmap_locked = self.hashmap.lock().unwrap();
-                        hashmap_locked.insert(*key, *val);
+                    // the resizer might lock the change log before the last insert completes,
+                    // at this point it has already read the log and set the resizing flag to false
+                    // in that case, we should just insert as normal
+                    if self.resizing_flag.load(Ordering::Relaxed) {
+                        log.push(ChangeLogEntry {
+                            key: *key,
+                            value: *val,
+                            isInsert: true,
+                        });
                         {
-                            // println!("Insert will grab the omap lock");
                             self.omap.lock().unwrap().insert(key, val, false);
                         }
-                        should_resize = hashmap_locked.len() >= (self.current_capacity as f64 * 0.8) as usize;
+                        // if the log is too large, block future insertions/erasures
+                        if log.len() >= (self.current_capacity / 5) as usize {
+                            self.block_modify_flag.store(true, Ordering::Relaxed);
+                        }
+                        return;
                     }
-                    if should_resize {
-                        // println!("Resizing the omap");
-                        self.current_capacity *= 2;
-                        // all subsequent changes will go to the log until the resizing finishes
-                        self.resizing_flag.store(true, Ordering::Relaxed);
-                        let mut self_clone = self.clone();
-                        // start the resizing process with a background thread
-                        let _handle = thread::spawn(move || {
-                            self_clone.resize();
-                        });
-                        
+                } 
+                // println!("Insert will grab the hashmap lock");
+                let should_resize: bool;
+                {
+                    let mut hashmap_locked = self.hashmap.lock().unwrap();
+                    hashmap_locked.insert(*key, *val);
+                    {
+                        // println!("Insert will grab the omap lock");
+                        self.omap.lock().unwrap().insert(key, val, false);
                     }
-                    
+                    should_resize = hashmap_locked.len() >= (self.current_capacity as f64 * 0.8) as usize;
                 }
-                
+                if should_resize {
+                    // println!("Resizing the omap");
+                    self.current_capacity *= 2;
+                    // all subsequent changes will go to the log until the resizing finishes
+                    self.resizing_flag.store(true, Ordering::Relaxed);
+                    let mut self_clone = self.clone();
+                    // start the resizing process with a background thread
+                    let _handle = thread::spawn(move || {
+                        self_clone.resize();
+                    });
+                }
             }
 
             pub fn get(&self, key: &$k) -> Option<$v> {
@@ -306,15 +308,18 @@ macro_rules! impl_scalable_omap {
                 }
                 if self.resizing_flag.load(Ordering::Relaxed) {
                     let mut log = self.change_log.lock().unwrap();
-                    log.push(ChangeLogEntry {
-                        key: *key,
-                        value: unsafe { std::mem::zeroed() },
-                        isInsert: false,
-                    });
-                } else {
-                    let mut hashmap_locked = self.hashmap.lock().unwrap();
-                    hashmap_locked.remove(key);
-                }
+                    if self.resizing_flag.load(Ordering::Relaxed) {
+                        log.push(ChangeLogEntry {
+                            key: *key,
+                            value: unsafe { std::mem::zeroed() },
+                            isInsert: false,
+                        });
+                        self.omap.lock().unwrap().erase(key, false);
+                        return;
+                    }
+                } 
+                let mut hashmap_locked = self.hashmap.lock().unwrap();
+                hashmap_locked.remove(key);
                 self.omap.lock().unwrap().erase(key, false);
             }
 
@@ -467,7 +472,7 @@ mod tests {
         omap.init_empty(sz);
         for _ in 0..sz {
             if rand::random::<bool>() {
-                let key = rand::random::<u64>();
+                let key = rand::random::<u64>() % (sz * 3) as u64;
                 let value = rand::random::<u64>();
                 omap.insert(&key, &value, false);
                 refmap.insert(key, value);
@@ -479,7 +484,7 @@ mod tests {
                 omap.erase(&key, false);
                 refmap.remove(&key);
             }
-            let searchkey = rand::random::<u64>();
+            let searchkey = rand::random::<u64>() % (sz * 3) as u64;
             let rv = omap.get(&searchkey);
             let refrv = refmap.get(&searchkey);
             if let Some(v) = refrv {
@@ -496,21 +501,18 @@ mod tests {
         let mut omap: ScalableOMap<u64, u64> = ScalableOMap::<u64, u64>::new();
         let mut refmap: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         omap.init_empty(sz);
-        for _ in 0..sz*1000 {
+        for i in 0..sz*1000 {
             if rand::random::<bool>() {
-                let key = rand::random::<u64>();
+                let key = rand::random::<u64>() % (i * 5 + 1) as u64;
                 let value = rand::random::<u64>();
                 omap.insert(&key, &value);
                 refmap.insert(key, value);
             } else if rand::random::<bool>() && !refmap.is_empty() {
-                let key = *refmap
-                    .keys()
-                    .nth(rand::random::<usize>() % refmap.len())
-                    .unwrap();
+                let key = rand::random::<u64>() % (i * 5 + 1) as u64;
                 omap.erase(&key);
                 refmap.remove(&key);
             }
-            let searchkey = rand::random::<u64>();
+            let searchkey = rand::random::<u64>() % (i * 5 + 1) as u64;
             let rv = omap.get(&searchkey);
             let refrv = refmap.get(&searchkey);
             if let Some(v) = refrv {
@@ -518,6 +520,11 @@ mod tests {
             } else {
                 assert_eq!(rv, None);
             }
+        }
+        // check the maps agree
+        for (k, v) in refmap.iter() {
+            let rv = omap.get(k);
+            assert_eq!(rv, Some(*v));
         }
     }
 
