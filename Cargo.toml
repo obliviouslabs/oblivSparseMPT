@@ -13,6 +13,7 @@ triehash = "0.8.4"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 proptest = "1.4.0"
+rand = "0.8.5"
 
 
 reth = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.6" }
@@ -41,6 +42,11 @@ dashmap = "5.5.3"
 #alloy-network = { git = "https://github.com/alloy-rs/alloy", rev = "39b8695" }
 #alloy-transport = { git = "https://github.com/alloy-rs/alloy", rev = "39b8695" }
 #alloy-trie = { git = "https://github.com/alloy-rs/alloy", rev = "39b8695" }
+
+[build-dependencies]
+bindgen = "0.69.4"
+cmake = "0.1.50"
+cxx = { version = "1.0.118", features = ["c++14", "c++17", "c++20"] }
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }

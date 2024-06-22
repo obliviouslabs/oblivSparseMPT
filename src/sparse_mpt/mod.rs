@@ -3,7 +3,9 @@
 mod basic_tests;
 mod sparse_tests;
 
-use crate::utils::clone_trie_node;
+pub mod omap;
+
+use crate::utils::{clone_trie_node, decode_trie_node};
 use ahash::HashMap;
 use alloy_primitives::bytes::BytesMut;
 use alloy_primitives::{hex, keccak256, B256};
@@ -11,6 +13,7 @@ use alloy_rlp::Encodable;
 use alloy_trie::nodes::{BranchNode, ExtensionNode, LeafNode, TrieNode, CHILD_INDEX_RANGE};
 use alloy_trie::{Nibbles, TrieMask, EMPTY_ROOT_HASH};
 use std::sync::{Arc, Mutex};
+use crate::sparse_mpt::omap::OMap;
 
 type NodeRef = Vec<u8>;
 
@@ -53,12 +56,18 @@ pub struct SparseTrieStore {
     sparse_nodes: Arc<dashmap::DashMap<NodeRef, TrieNode, ahash::RandomState>>,
 }
 
+pub struct OblivSparseTrieStore {
+    sparse_original_root: Arc<Mutex<Option<NodeRef>>>,
+    sparse_nodes: OMap<[u8; 32], [u8; 104]>,
+}
+
 impl SparseTrieStore {
     fn get_root_node(&self) -> Option<NodeRef> {
         self.sparse_original_root.lock().unwrap().clone()
     }
 
     fn get_node(&self, node: &NodeRef) -> Option<TrieNode> {
+        println!("get_node of length {:?}", node.len());
         self.sparse_nodes
             .get(node)
             .map(|node| clone_trie_node(&node))
@@ -81,10 +90,55 @@ impl SparseTrieStore {
     }
 
     fn add_new_sparse_node(&self, node: TrieNode) -> NodeRef {
+        println!("add_new_sparse_node {:?}", node);
         let mut buff = Vec::new();
         let node_ref = node.rlp(&mut buff);
+        println!("key {:?}", node_ref);
         self.sparse_nodes.insert(node_ref.clone(), node);
         node_ref
+    }
+}
+
+impl OblivSparseTrieStore {
+    fn get_root_node(&self) -> Option<NodeRef> {
+        self.sparse_original_root.lock().unwrap().clone()
+    }
+
+    fn get_node(&mut self, node: &NodeRef) -> Option<TrieNode> {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&node[1..33]);
+        self.sparse_nodes
+            .get(&key).map(|node| decode_trie_node(&node))
+    }
+
+    pub fn add_sparse_nodes_from_proof(&mut self, proof_path: Vec<TrieNode>) {
+        for (idx, nodes) in proof_path.into_iter().enumerate() {
+            let reference = self.add_new_sparse_node(nodes);
+            if idx == 0 {
+                let mut sparse_original_root = self.sparse_original_root.lock().unwrap();
+                if sparse_original_root.is_none() {
+                    *sparse_original_root = Some(reference);
+                }
+            }
+        }
+    }
+
+    pub fn add_sparse_node(&mut self, node: TrieNode) {
+        self.add_new_sparse_node(node);
+    }
+
+    fn add_new_sparse_node(&mut self, node: TrieNode) -> NodeRef {
+        let mut buff = Vec::new();
+        let node_ref = node.rlp(&mut buff);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&node_ref[1..33]);
+        let mut val = [0u8; 104];
+        self.sparse_nodes.insert(&key, &mut val, false);
+        node_ref
+    }
+
+    fn init_empty(&mut self, sz: u32) {
+        self.sparse_nodes.init_empty(sz);
     }
 }
 

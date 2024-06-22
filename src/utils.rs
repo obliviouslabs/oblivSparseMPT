@@ -60,3 +60,7 @@ pub fn clone_trie_node(node: &TrieNode) -> TrieNode {
         }),
     }
 }
+
+pub fn decode_trie_node(data: &[u8]) -> TrieNode {
+    TrieNode::decode(&mut data.as_ref()).expect("trie node decode")
+}
