@@ -13,7 +13,7 @@ use alloy_rlp::Encodable;
 use alloy_trie::nodes::{BranchNode, ExtensionNode, LeafNode, TrieNode, CHILD_INDEX_RANGE};
 use alloy_trie::{Nibbles, TrieMask, EMPTY_ROOT_HASH};
 use std::sync::{Arc, Mutex};
-use crate::sparse_mpt::omap::OMap;
+use crate::sparse_mpt::omap::ScalableOMap;
 
 type NodeRef = Vec<u8>;
 
@@ -55,10 +55,10 @@ pub struct SparseTrieStore {
     sparse_original_root: Arc<Mutex<Option<NodeRef>>>,
     sparse_nodes: Arc<dashmap::DashMap<NodeRef, TrieNode, ahash::RandomState>>,
 }
-
+#[derive(Debug, Clone)]
 pub struct OblivSparseTrieStore {
     sparse_original_root: Arc<Mutex<Option<NodeRef>>>,
-    sparse_nodes: OMap<[u8; 32], [u8; 104]>,
+    sparse_nodes: ScalableOMap<[u8; 32], [u8; 532]>,
 }
 
 impl SparseTrieStore {
@@ -67,7 +67,6 @@ impl SparseTrieStore {
     }
 
     fn get_node(&self, node: &NodeRef) -> Option<TrieNode> {
-        println!("get_node of length {:?}", node.len());
         self.sparse_nodes
             .get(node)
             .map(|node| clone_trie_node(&node))
@@ -90,10 +89,8 @@ impl SparseTrieStore {
     }
 
     fn add_new_sparse_node(&self, node: TrieNode) -> NodeRef {
-        println!("add_new_sparse_node {:?}", node);
         let mut buff = Vec::new();
         let node_ref = node.rlp(&mut buff);
-        println!("key {:?}", node_ref);
         self.sparse_nodes.insert(node_ref.clone(), node);
         node_ref
     }
@@ -104,7 +101,7 @@ impl OblivSparseTrieStore {
         self.sparse_original_root.lock().unwrap().clone()
     }
 
-    fn get_node(&mut self, node: &NodeRef) -> Option<TrieNode> {
+    fn get_node(&self, node: &NodeRef) -> Option<TrieNode> {
         let mut key = [0u8; 32];
         key.copy_from_slice(&node[1..33]);
         self.sparse_nodes
@@ -113,7 +110,7 @@ impl OblivSparseTrieStore {
 
     pub fn add_sparse_nodes_from_proof(&mut self, proof_path: Vec<TrieNode>) {
         for (idx, nodes) in proof_path.into_iter().enumerate() {
-            let reference = self.add_new_sparse_node(nodes);
+            let reference = self.add_new_sparse_node(&nodes);
             if idx == 0 {
                 let mut sparse_original_root = self.sparse_original_root.lock().unwrap();
                 if sparse_original_root.is_none() {
@@ -123,17 +120,18 @@ impl OblivSparseTrieStore {
         }
     }
 
-    pub fn add_sparse_node(&mut self, node: TrieNode) {
+    pub fn add_sparse_node(&mut self, node: &TrieNode) {
         self.add_new_sparse_node(node);
     }
 
-    fn add_new_sparse_node(&mut self, node: TrieNode) -> NodeRef {
+    fn add_new_sparse_node(&mut self, node: &TrieNode) -> NodeRef {
         let mut buff = Vec::new();
         let node_ref = node.rlp(&mut buff);
         let mut key = [0u8; 32];
         key.copy_from_slice(&node_ref[1..33]);
-        let mut val = [0u8; 104];
-        self.sparse_nodes.insert(&key, &mut val, false);
+        let mut val = [0u8; 532];
+        val[0..buff.len()].copy_from_slice(&buff);
+        self.sparse_nodes.insert(&key, &mut val);
         node_ref
     }
 
@@ -151,9 +149,18 @@ impl Default for SparseTrieStore {
     }
 }
 
+impl Default for OblivSparseTrieStore {
+    fn default() -> Self {
+        Self {
+            sparse_original_root: Arc::new(Mutex::new(None)),
+            sparse_nodes: ScalableOMap::<[u8; 32], [u8; 532]>::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SparseMPT {
-    sparse_trie_store: SparseTrieStore,
+    sparse_trie_store: OblivSparseTrieStore,
 
     missing_nodes: HashMap<NodeRef, Nibbles>,
 
@@ -226,7 +233,7 @@ fn branch_node_get_child_reference(branch: &BranchNode, child: u8) -> (Option<No
 impl SparseMPT {
     pub fn new_empty() -> Self {
         Self {
-            sparse_trie_store: SparseTrieStore::default(),
+            sparse_trie_store: OblivSparseTrieStore::default(),
             missing_nodes: Default::default(),
             current_root: None,
             new_nodes: HashMap::default(),
@@ -235,8 +242,17 @@ impl SparseMPT {
 
     pub fn with_sparse_store(sparse_trie_store: SparseTrieStore) -> Self {
         let current_root = sparse_trie_store.get_root_node();
+        let mut obliv_sparse_trie_store = OblivSparseTrieStore::default();
+        obliv_sparse_trie_store.init_empty(1024);
+        // copy all nodes from sparse_trie_store to obliv_sparse_trie_store
+        // iterate the dashmap
+        for node in sparse_trie_store.sparse_nodes.iter() {
+            let trie_node = node.value();
+            obliv_sparse_trie_store.add_sparse_node(&trie_node);
+        }
+
         Self {
-            sparse_trie_store,
+            sparse_trie_store: obliv_sparse_trie_store,
             missing_nodes: Default::default(),
             current_root,
             new_nodes: HashMap::default(),

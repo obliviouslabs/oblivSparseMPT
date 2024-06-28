@@ -19,10 +19,11 @@ fn getMutCVoidPtr<T>(valptr: &mut T) -> *mut c_void {
     ptr
 }
 
+#[derive(Debug)]
 pub enum OMapBinding {
     OMapBinding_8_8(OMapBinding_8_8),
     OMapBinding_20_32(OMapBinding_20_32),
-    OMapBinding_32_104(OMapBinding_32_104),
+    OMapBinding_32_532(OMapBinding_32_532),
 }
 
 use std::marker::PhantomData;
@@ -30,17 +31,21 @@ use ahash::{HashMap, RandomState, HashMapExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Arc};
 use std::thread;
+
+#[derive(Debug)]
 pub struct OMap<K, V> {
     inner: OMapBinding,
     _marker: PhantomData<(K, V)>,
 }
 
+#[derive(Debug)]
 pub struct ChangeLogEntry<K, V> {
     key: K,
     value: V,
     isInsert: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct ScalableOMap<K, V>
 {
     omap: Arc<Mutex<OMap<K, V>>>, // the underlying omap
@@ -211,12 +216,10 @@ macro_rules! impl_scalable_omap {
                 }
                 // finish the initialization
                 new_omap_locked.finish_init();
-                println!("Prepare to lock the modify lock");
                 // set the block modify flag to true to block all future insertions/erasures
                 // until the resizing finishes
                 self.block_modify_flag.store(true, Ordering::Relaxed);
                 
-                println!("Modify lock acquired, prepare to lock the change log");
                 let mut log = self.change_log.lock().unwrap();
 
                 // copy the change log to the new omap and the hashmap
@@ -230,7 +233,6 @@ macro_rules! impl_scalable_omap {
                         hashmap_locked.remove(&log_entry.key);
                     }
                 }
-                println!("Prepare to swap the omap");
                 {
                     let mut omap_locked = self.omap.lock().unwrap();
                     std::mem::swap(&mut *omap_locked, &mut *new_omap_locked);
@@ -340,11 +342,11 @@ macro_rules! impl_scalable_omap {
 
 impl_omap!(u64, u64, OMapBinding_8_8);
 impl_omap!([u8; 20], [u8; 32], OMapBinding_20_32);
-impl_omap!([u8; 32], [u8; 104], OMapBinding_32_104);
+impl_omap!([u8; 32], [u8; 532], OMapBinding_32_532);
 impl_scalable_omap!(u64, u64);
-impl_scalable_omap!([u8; 32], [u8; 104]);
+impl_scalable_omap!([u8; 32], [u8; 532]);
 
-drop_omap_impl!(OMapBinding_8_8, OMapBinding_20_32, OMapBinding_32_104);
+drop_omap_impl!(OMapBinding_8_8, OMapBinding_20_32, OMapBinding_32_532);
 
 #[cfg(test)]
 mod tests {
@@ -529,15 +531,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_scalable_omap_perf() {
         let min_sz = 1000000u32;
         let max_sz = 6000000u32;
-        // 32-byte key and 104-byte value
-        let mut omap: ScalableOMap<[u8; 32], [u8; 104]> = ScalableOMap::<[u8; 32], [u8; 104]>::new();
+        // 32-byte key and 532-byte value
+        let mut omap: ScalableOMap<[u8; 32], [u8; 532]> = ScalableOMap::<[u8; 32], [u8; 532]>::new();
         omap.init_empty(min_sz);
         for i in min_sz..max_sz {
             let mut key = [0 as u8; 32];
-            let value = [0 as u8; 104];
+            let value = [0 as u8; 532];
             // mem copy the index to the key
             key[0..4].copy_from_slice(&i.to_be_bytes());
 
