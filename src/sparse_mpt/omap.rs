@@ -1,4 +1,3 @@
-
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -26,10 +25,10 @@ pub enum OMapBinding {
     OMapBinding_32_532(OMapBinding_32_532),
 }
 
+use ahash::{HashMap, HashMapExt, RandomState};
 use std::marker::PhantomData;
-use ahash::{HashMap, RandomState, HashMapExt};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Debug)]
@@ -46,14 +45,14 @@ pub struct ChangeLogEntry<K, V> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScalableOMap<K, V>
-{
-    omap: Arc<Mutex<OMap<K, V>>>, // the underlying omap
-    hashmap: Arc<Mutex<HashMap<K, V>>>, // the reference hashmap for upscaling
+pub struct ScalableOMap<K, V> {
+    omap: Arc<Mutex<OMap<K, V>>>,                      // the underlying omap
+    hashmap: Arc<Mutex<HashMap<K, V>>>,                // the reference hashmap for upscaling
     change_log: Arc<Mutex<Vec<ChangeLogEntry<K, V>>>>, // log the changes during upscaling
-    current_capacity: u32, // the current capacity of the omap
-    resizing_flag: Arc<AtomicBool>, // mutex for resizing
+    current_capacity: u32,                             // the current capacity of the omap
+    resizing_flag: Arc<AtomicBool>,                    // mutex for resizing
     block_modify_flag: Arc<AtomicBool>, // if this flag is true, block all modifications
+    cache_in_byte: u64,
 }
 
 // Define a macro to implement OMap for different key-value combinations
@@ -168,8 +167,7 @@ macro_rules! drop_omap_impl {
 
 macro_rules! impl_scalable_omap {
     ($k:ty, $v:ty) => {
-        impl ScalableOMap<$k, $v> 
-        {
+        impl ScalableOMap<$k, $v> {
             pub fn new() -> Self {
                 Self {
                     omap: Arc::new(Mutex::new(OMap::<$k, $v>::new())),
@@ -178,6 +176,7 @@ macro_rules! impl_scalable_omap {
                     current_capacity: 0,
                     resizing_flag: Arc::new(AtomicBool::new(false)),
                     block_modify_flag: Arc::new(AtomicBool::new(false)),
+                    cache_in_byte: 0,
                 }
             }
 
@@ -190,6 +189,7 @@ macro_rules! impl_scalable_omap {
                     current_capacity: self.current_capacity,
                     resizing_flag: self.resizing_flag.clone(),
                     block_modify_flag: self.block_modify_flag.clone(),
+                    cache_in_byte: self.cache_in_byte,
                 }
             }
 
@@ -199,16 +199,23 @@ macro_rules! impl_scalable_omap {
             }
 
             pub fn init_empty_external(&mut self, sz: u32, cache_in_byte: u64) {
-                self.omap.lock().unwrap().init_empty_external(sz, cache_in_byte);
+                self.omap
+                    .lock()
+                    .unwrap()
+                    .init_empty_external(sz, cache_in_byte);
+                self.current_capacity = sz;
+                self.cache_in_byte = cache_in_byte;
             }
 
             fn resize(&mut self) {
-                println!("Resizing the omap to {}", self.current_capacity);
-
                 // create a new omap with double the capacity
                 let new_omap = Arc::new(Mutex::new(OMap::<$k, $v>::new()));
-                let mut new_omap_locked = new_omap.lock().unwrap(); 
-                new_omap_locked.start_init(self.current_capacity);
+                let mut new_omap_locked = new_omap.lock().unwrap();
+                if self.cache_in_byte != 0 {
+                    new_omap_locked.start_init_external(self.current_capacity, self.cache_in_byte);
+                } else {
+                    new_omap_locked.start_init(self.current_capacity);
+                }
                 // copy the current hashmap to the new omap
                 let mut hashmap_locked = self.hashmap.lock().unwrap();
                 for (k, v) in hashmap_locked.iter() {
@@ -219,7 +226,7 @@ macro_rules! impl_scalable_omap {
                 // set the block modify flag to true to block all future insertions/erasures
                 // until the resizing finishes
                 self.block_modify_flag.store(true, Ordering::Relaxed);
-                
+
                 let mut log = self.change_log.lock().unwrap();
 
                 // copy the change log to the new omap and the hashmap
@@ -238,22 +245,23 @@ macro_rules! impl_scalable_omap {
                     std::mem::swap(&mut *omap_locked, &mut *new_omap_locked);
                 }
                 log.clear();
-                println!("Resizing finished, current capacity: {}", self.current_capacity);
+                println!(
+                    "Resizing finished, current capacity: {}",
+                    self.current_capacity
+                );
                 self.resizing_flag.store(false, Ordering::Relaxed);
                 self.block_modify_flag.store(false, Ordering::Relaxed);
             }
 
             pub fn insert(&mut self, key: &$k, val: &$v) {
-                // println!("Inserting key: {:?}, value: {:?}", key, val);
                 // since the insert takes a mutable reference to self, at most one insert can happen at a time
                 // busy wait if the block modify flag is set, either because the resizer is
                 // reading the log, or the log is too long and we have to pause the insertions
                 while self.block_modify_flag.load(Ordering::Relaxed) {
                     // busy wait
                 }
-                
+
                 if self.resizing_flag.load(Ordering::Relaxed) {
-                    // println!("Resizing in progress, inserting to the log");
                     let mut log = self.change_log.lock().unwrap();
                     // the resizer might lock the change log before the last insert completes,
                     // at this point it has already read the log and set the resizing flag to false
@@ -273,20 +281,18 @@ macro_rules! impl_scalable_omap {
                         }
                         return;
                     }
-                } 
-                // println!("Insert will grab the hashmap lock");
+                }
                 let should_resize: bool;
                 {
                     let mut hashmap_locked = self.hashmap.lock().unwrap();
                     hashmap_locked.insert(*key, *val);
                     {
-                        // println!("Insert will grab the omap lock");
                         self.omap.lock().unwrap().insert(key, val, false);
                     }
-                    should_resize = hashmap_locked.len() >= (self.current_capacity as f64 * 0.8) as usize;
+                    should_resize =
+                        hashmap_locked.len() >= (self.current_capacity as f64 * 0.8) as usize;
                 }
                 if should_resize {
-                    // println!("Resizing the omap");
                     self.current_capacity *= 2;
                     // all subsequent changes will go to the log until the resizing finishes
                     self.resizing_flag.store(true, Ordering::Relaxed);
@@ -319,13 +325,14 @@ macro_rules! impl_scalable_omap {
                         self.omap.lock().unwrap().erase(key, false);
                         return;
                     }
-                } 
+                }
                 let mut hashmap_locked = self.hashmap.lock().unwrap();
                 hashmap_locked.remove(key);
                 self.omap.lock().unwrap().erase(key, false);
             }
 
             pub fn start_init(&mut self, sz: u32) {
+                self.current_capacity = sz;
                 self.omap.lock().unwrap().start_init(sz);
             }
 
@@ -334,7 +341,12 @@ macro_rules! impl_scalable_omap {
             }
 
             pub fn start_init_external(&mut self, sz: u32, cache_in_byte: u64) {
-                self.omap.lock().unwrap().start_init_external(sz, cache_in_byte);
+                self.current_capacity = sz;
+                self.cache_in_byte = cache_in_byte;
+                self.omap
+                    .lock()
+                    .unwrap()
+                    .start_init_external(sz, cache_in_byte);
             }
         }
     };
@@ -503,7 +515,7 @@ mod tests {
         let mut omap: ScalableOMap<u64, u64> = ScalableOMap::<u64, u64>::new();
         let mut refmap: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         omap.init_empty(sz);
-        for i in 0..sz*1000 {
+        for i in 0..sz * 1000 {
             if rand::random::<bool>() {
                 let key = rand::random::<u64>() % (i * 5 + 1) as u64;
                 let value = rand::random::<u64>();
@@ -533,11 +545,16 @@ mod tests {
     #[test]
     #[ignore]
     fn test_scalable_omap_perf() {
-        let min_sz = 1000000u32;
-        let max_sz = 6000000u32;
+        let min_sz = 100000u32;
+        let max_sz = 1000000u32;
         // 32-byte key and 532-byte value
-        let mut omap: ScalableOMap<[u8; 32], [u8; 532]> = ScalableOMap::<[u8; 32], [u8; 532]>::new();
-        omap.init_empty(min_sz);
+        unsafe {
+            ResetBackend((max_sz as u64) * 4096);
+        }
+        let mut omap: ScalableOMap<[u8; 32], [u8; 532]> =
+            ScalableOMap::<[u8; 32], [u8; 532]>::new();
+        let insertStart = std::time::Instant::now();
+        omap.init_empty_external(min_sz, 200000000u64);
         for i in min_sz..max_sz {
             let mut key = [0 as u8; 32];
             let value = [0 as u8; 532];
@@ -545,9 +562,18 @@ mod tests {
             key[0..4].copy_from_slice(&i.to_be_bytes());
 
             omap.insert(&key, &value);
+        }
+        let insertDuration = insertStart.elapsed();
+        println!("Insertion time: {:?}", insertDuration / (max_sz - min_sz));
+        // start timing
+        let round = 100000;
+        let findStart = std::time::Instant::now();
+        for i in 0..round {
             let mut searchkey = [0 as u8; 32];
-            searchkey[0..4].copy_from_slice(&(i-1000).to_be_bytes());
+            searchkey[0..4].copy_from_slice(&(i + min_sz - 1000).to_be_bytes());
             omap.get(&searchkey);
         }
+        let findDuration = findStart.elapsed();
+        println!("Find time: {:?}", findDuration / round);
     }
 }
